@@ -133,14 +133,11 @@ A weighted scoring mechanism is applied to balance these factors depending on ro
 
 *Note: A voltage divider circuit MUST be used to convert the output voltage level of the GP2Y1010AU0F sensor (maximum approximately 5V) to a voltage level suitable for the analog input of the ESP32 microcontroller (maximum 3.3V). The circuit consists of two resistors connected in series, where the output voltage is taken at the midpoint between the two resistors according to the voltage divider principle. Using a voltage divider circuit helps protect the ADC pin of the ESP32 and ensures accurate and safe measurement signals.
 
-GP2Y Vo ──[10k]──┬── GPIO35
-                 │
-                [20k]
-                 │
-                GND
+<img width="253" height="135" alt="image" src="https://github.com/user-attachments/assets/9335fc01-7906-4296-99ad-272f42a3d534" />
+
   
 ### 2. Firmware
-- Open project in Arduino IDE or PlatformIO  
+- Open the project in Arduino IDE or PlatformIO  
 - Install required libraries:
   - TinyGSM  
   - Adafruit AHTX0  
@@ -150,8 +147,8 @@ GP2Y Vo ──[10k]──┬── GPIO35
 - Upload firmware to ESP32  
 
 ### 3. Node-RED
-- Set up MQTT broker connection  
-- Create flow to receive ESP32 data  
+- Set up a free MQTT broker connection (HiveMQ, EMQX, Mosquitto,...) 
+- Create a flow to receive ESP32 data  
 - Process and forward data to Firebase  
 <img width="1323" height="71" alt="image" src="https://github.com/user-attachments/assets/ceeb23c0-666d-4723-b244-f15d3e172ad4" />
 
@@ -165,7 +162,7 @@ GP2Y Vo ──[10k]──┬── GPIO35
 ## Limitations
 - Low-cost sensors provide relative measurements, not reference-grade accuracy  
 - MQ-135 requires calibration for reliable gas index values  
-- Data coverage depends on deployment density of IoT nodes  
+- Data coverage depends on the deployment density of IoT nodes  
 - ESP32-CAM is not yet integrated into the current system  
 ---
 
