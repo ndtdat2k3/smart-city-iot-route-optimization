@@ -132,6 +132,7 @@ A weighted scoring mechanism is applied to balance these factors depending on ro
 <img width="612" height="663" alt="image" src="https://github.com/user-attachments/assets/44df917b-e3a2-407e-b8cc-368f3f385a15" />
 
 *Note: A voltage divider circuit MUST be used to convert the output voltage level of the GP2Y1010AU0F sensor (maximum approximately 5V) to a voltage level suitable for the analog input of the ESP32 microcontroller (maximum 3.3V). The circuit consists of two resistors connected in series, where the output voltage is taken at the midpoint between the two resistors according to the voltage divider principle. Using a voltage divider circuit helps protect the ADC pin of the ESP32 and ensures accurate and safe measurement signals.
+
 GP2Y Vo ──[10k]──┬── GPIO35
                  │
                 [20k]
