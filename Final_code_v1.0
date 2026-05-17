@@ -1,0 +1,365 @@
+#define TINY_GSM_MODEM_SIM7600
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <ArduinoJson.h>
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+#include "GP2Y1010AU0F.h"
+
+Adafruit_AHTX0 aht;
+
+// ================= DEFINE =================
+#define MQ135_PIN 34  
+#define measurePin 35   // Connect dust sensor analog measure pin to G35 pin
+#define ledPin 25    // Connect dust sensor LED pin to Arduino pin 2
+
+const float baselineADC = 1100;
+GP2Y1010AU0F dustSensor(ledPin, measurePin); // Construct dust sensor global object
+float dustDensity = 0;
+
+// ================= CONVERT PM2.5 TO AQI =================
+int convertPM25ToAQI(float pm25) {
+  float C = pm25;
+  float Clow, Chigh;
+  int Ilow, Ihigh;
+
+  if (C <= 12.0) {
+    Clow = 0.0; Chigh = 12.0;
+    Ilow = 0; Ihigh = 50;
+  }
+  else if (C <= 35.4) {
+    Clow = 12.1; Chigh = 35.4;
+    Ilow = 51; Ihigh = 100;
+  }
+  else if (C <= 55.4) {
+    Clow = 35.5; Chigh = 55.4;
+    Ilow = 101; Ihigh = 150;
+  }
+  else if (C <= 150.4) {
+    Clow = 55.5; Chigh = 150.4;
+    Ilow = 151; Ihigh = 200;
+  }
+  else if (C <= 250.4) {
+    Clow = 150.5; Chigh = 250.4;
+    Ilow = 201; Ihigh = 300;
+  }
+  else {
+    return 300; // vượt ngưỡng
+  }
+
+  float AQI = (Ihigh - Ilow) * (C - Clow) / (Chigh - Clow) + Ilow;
+  return (int)AQI;
+}
+
+// ================= AQI LEVEL =================
+String getAQILevel(int aqi) {
+  if (aqi <= 50) return "Good";
+  else if (aqi <= 100) return "Moderate";
+  else if (aqi <= 150) return "Unhealthy for Sensitive Groups";
+  else if (aqi <= 200) return "Unhealthy";
+  else return "Very Unhealthy";
+}
+
+// ================= READ FILTERED ADC =================
+float readMQ135ADC(int samples = 20) {
+
+  float sum = 0;
+
+  for(int i = 0; i < samples; i++) {
+
+    sum += analogRead(MQ135_PIN);
+
+    delay(10);
+  }
+
+  return sum / samples;
+}
+
+// ================= CALCULATE GAS INDEX =================
+float getGasIndex(float correctedADC) {
+
+  return correctedADC / baselineADC;
+}
+
+// ================= CLASSIFY AIR QUALITY =================
+String getGasLevel(float index) {
+
+  if(index < 1.25) {
+    return "GOOD";
+  }
+
+  else if(index < 1.70) {
+    return "MODERATE";
+  }
+
+  else if(index < 2.30) {
+    return "UNHEALTHY_FOR_SENSITIVE_GROUPS";
+  }
+
+  else if(index < 3.20) {
+    return "UNHEALTHY";
+  }
+
+  else {
+    return "HAZARDOUS";
+  }
+}
+
+// ================= MQ135 TEMP/HUM COMPENSATION =================
+float getCompensationFactor(float temp, float hum) {
+
+  float factor = 1.0;
+
+  // ===== 30% RH CURVE =====
+  if(hum < 45) {
+
+    factor =
+      (0.00004 * temp * temp)
+      - (0.0154 * temp)
+      + 1.5538;
+  }
+
+  // ===== 60% RH CURVE =====
+  else if(hum < 72) {
+
+    factor =
+      (0.00002 * temp * temp)
+      - (0.0129 * temp)
+      + 1.3216;
+  }
+
+  // ===== 85% RH CURVE =====
+  else {
+
+    factor =
+      (0.00003 * temp * temp)
+      - (0.0114 * temp)
+      + 1.147;
+  }
+
+  return factor;
+}
+
+// ================= Corrected ADC =================
+float getCorrectedADC(float rawADC, float temp, float hum) {
+
+  float factor = getCompensationFactor(temp, hum);
+
+  return rawADC / factor;
+}
+
+// ================= UART MODEM =================
+#define MODEM_RX 16
+#define MODEM_TX 17
+
+HardwareSerial SerialAT(2);
+
+// ================= APN =================
+const char apn[] = "v-internet";
+const char user[] = "";
+const char pass[] = "";
+
+// ================= MQTT =================
+const char* broker =
+"broker.hivemq.com";
+
+const char* topic =
+"dat/envmonitor/device1/data";
+
+// ================= OBJECT =================
+TinyGsm modem(SerialAT);
+
+TinyGsmClient client(modem);
+
+PubSubClient mqtt(client);
+
+void connectMQTT() {
+
+  while (!mqtt.connected()) {
+
+    Serial.println("Đang kết nối MQTT...");
+
+    String clientID = "ESP32Client-";
+    clientID += String(random(0xffff), HEX);
+
+    if (mqtt.connect(
+          clientID.c_str(),
+          "esp32iot",
+          "Dat123456789"
+        )) {
+
+      Serial.println("MQTT connected!");
+
+    } else {
+
+      Serial.print("MQTT failed, rc=");
+      Serial.println(mqtt.state());
+
+      delay(3000);
+    }
+  }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(10);
+
+  // ================= Dust sensor =================
+  dustSensor.begin();
+
+  // ================= MQ135 =================
+  pinMode(MQ135_PIN, INPUT);
+
+  // ================= AHT10 =================
+  Wire.begin(21, 22);
+
+  if (!aht.begin()) {
+
+    Serial.println("Không tìm thấy AHT10!");
+
+    while (1);
+  }
+
+  Serial.println("AHT10 OK");
+
+  // ================= MODEM =================
+  SerialAT.begin(115200, SERIAL_8N1,
+                 MODEM_RX, MODEM_TX);
+
+  delay(3000);
+
+  Serial.println("Khởi động modem...");
+
+  modem.restart();
+
+  Serial.println("Đang kết nối mạng...");
+
+  if (!modem.waitForNetwork()) {
+
+    Serial.println("Không có mạng!");
+
+    while (1);
+  }
+
+  Serial.println("Mạng OK");
+
+  Serial.println("Đang kết nối GPRS...");
+
+  if (!modem.gprsConnect(apn, user, pass)) {
+
+    Serial.println("GPRS fail");
+
+    while (1);
+  }
+
+  Serial.println("GPRS connected!");
+
+  // ================= MQTT =================
+  mqtt.setServer(broker, 1883);
+
+  connectMQTT();
+}
+
+void loop() {
+
+  if (!mqtt.connected()) {
+    connectMQTT();
+  }
+
+  mqtt.loop();
+
+
+
+  // AHT10
+  sensors_event_t humidity, temp;
+
+  aht.getEvent(&humidity, &temp);
+
+  float t = round(temp.temperature * 100)/ 100.0;
+  float h = round(humidity.relative_humidity * 100)/ 100.0;
+
+  Serial.print("Temp: ");
+  Serial.println(t);
+
+  Serial.print("Hum: ");
+  Serial.println(h);
+
+
+
+  // Dust sensor
+  dustDensity = dustSensor.read();
+  int aqi = round(convertPM25ToAQI(dustDensity));
+  String aqiLevel = getAQILevel(aqi);
+
+  Serial.print("Dust Density: ");
+  Serial.print(dustDensity);
+  Serial.println(" ug/m3");
+
+  Serial.print("AQI: ");
+  Serial.println(aqi);
+
+  Serial.print("AQI Level: ");
+  Serial.println(aqiLevel);
+
+
+
+  //MQ-135
+  float rawADC = readMQ135ADC();
+
+  float correctedADC = getCorrectedADC(rawADC, t, h);
+
+  float gasIndex = round(getGasIndex(correctedADC) * 100) / 100.0;
+
+  String level = getGasLevel(gasIndex);
+
+  Serial.println("==========");
+
+  Serial.print("Raw ADC: ");
+  Serial.println(rawADC);
+
+  Serial.print("Corrected ADC: ");
+  Serial.println(correctedADC);
+
+  Serial.print("Compensation Factor: ");
+  Serial.println(getCompensationFactor(t, h));
+
+  Serial.print("Baseline ADC: ");
+  Serial.println(baselineADC);
+
+  Serial.print("Gas Index: ");
+  Serial.println(gasIndex);
+  
+  int raw = analogRead(measurePin);
+  float voltage = raw * (3.3 / 4095.0);
+
+  Serial.print("Dust raw ADC: ");
+  Serial.println(raw);
+
+  Serial.print("Dust voltage: ");
+  Serial.println(voltage);
+  
+  // ================= JSON =================
+  StaticJsonDocument<200> doc;
+
+  doc["temp"] = String(t, 2);
+  doc["hum"] = String(h, 2);
+  doc["gasIndex"] = String(gasIndex, 2);
+  doc["aqi"] = aqi;
+  char buffer[256];
+
+  serializeJson(doc, buffer);
+
+  // ================= MQTT PUBLISH =================
+  mqtt.publish(topic, buffer);
+
+  Serial.println("Đã gửi MQTT:");
+  Serial.println(buffer);
+
+  Serial.println("------------------");
+
+  delay(4800); // cộng 200ms delay từ loop MQ-135 lấy gtri trung bình = 5s
+}
