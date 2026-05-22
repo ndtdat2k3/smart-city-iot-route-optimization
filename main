@@ -1,0 +1,538 @@
+#define TINY_GSM_MODEM_SIM7600
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <ArduinoJson.h>
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+#include "GP2Y1010AU0F.h"
+#include "time.h"
+#include <TimeLib.h>
+
+Adafruit_AHTX0 aht;
+
+
+typedef struct {
+  float temp;
+  float hum;
+  float rawGas;
+  float dust;
+} RawData;
+
+typedef struct {
+  float temp;
+  float hum;
+
+  float gasIndex;
+  const char* gasLevel;
+
+  int aqi;
+  const char* aqiLevel;
+
+  float dust;
+} ProcessedData;
+
+QueueHandle_t rawQueue;
+QueueHandle_t processedQueue;
+
+// ================= DEFINE =================
+#define MQ135_PIN 34  
+#define measurePin 35   // Connect dust sensor analog measure pin to G35 pin
+#define ledPin 25    // Connect dust sensor LED pin to Arduino pin 2
+
+const float baselineADC = 1050;
+GP2Y1010AU0F dustSensor(ledPin, measurePin); // Construct dust sensor global object
+float dustDensity = 0;
+
+unsigned long baseEpoch = 0;
+unsigned long baseMillis = 0;
+String updateTimeStr = "";
+
+// ================= CONVERT PM2.5 TO AQI =================
+int convertPM25ToAQI(float pm25) {
+  float C = pm25;
+  float Clow, Chigh;
+  int Ilow, Ihigh;
+
+  if (C <= 12.0) {
+    Clow = 0.0; Chigh = 12.0;
+    Ilow = 0; Ihigh = 50;
+  }
+  else if (C <= 35.4) {
+    Clow = 12.1; Chigh = 35.4;
+    Ilow = 51; Ihigh = 100;
+  }
+  else if (C <= 55.4) {
+    Clow = 35.5; Chigh = 55.4;
+    Ilow = 101; Ihigh = 150;
+  }
+  else if (C <= 150.4) {
+    Clow = 55.5; Chigh = 150.4;
+    Ilow = 151; Ihigh = 200;
+  }
+  else if (C <= 250.4) {
+    Clow = 150.5; Chigh = 250.4;
+    Ilow = 201; Ihigh = 300;
+  }
+  else {
+    return 300; // vượt ngưỡng
+  }
+
+  float AQI = (Ihigh - Ilow) * (C - Clow) / (Chigh - Clow) + Ilow;
+  return (int)AQI;
+}
+
+// ================= AQI LEVEL =================
+const char* getAQILevel(int aqi) {
+  if (aqi <= 50) return "Good";
+  else if (aqi <= 100) return "Moderate";
+  else if (aqi <= 150) return "Unhealthy for Sensitive Groups";
+  else if (aqi <= 200) return "Unhealthy";
+  else return "Very Unhealthy";
+}
+
+// ================= READ FILTERED ADC =================
+float readMQ135ADC(int samples = 20) {
+
+  float sum = 0;
+
+  for(int i = 0; i < samples; i++) {
+
+    sum += analogRead(MQ135_PIN);
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+
+  return sum / samples;
+}
+
+// ================= CALCULATE GAS INDEX =================
+float getGasIndex(float correctedADC) {
+
+  return correctedADC / baselineADC;
+}
+
+// ================= CLASSIFY AIR QUALITY =================
+const char* getGasLevel(float index) {
+
+  if(index < 1.25) {
+    return "GOOD";
+  }
+
+  else if(index < 1.70) {
+    return "MODERATE";
+  }
+
+  else if(index < 2.50) {
+    return "UNHEALTHY_FOR_SENSITIVE_GROUPS";
+  }
+
+  else if(index < 3.20) {
+    return "UNHEALTHY";
+  }
+
+  else {
+    return "HAZARDOUS";
+  }
+}
+
+// ================= MQ135 TEMP/HUM COMPENSATION =================
+float getCompensationFactor(float temp, float hum) {
+
+  float factor = 1.0;
+
+  // ===== 30% RH CURVE =====
+  if(hum < 45) {
+
+    factor =
+      (0.00004 * temp * temp)
+      - (0.0154 * temp)
+      + 1.5538;
+  }
+
+  // ===== 60% RH CURVE =====
+  else if(hum < 72) {
+
+    factor =
+      (0.00002 * temp * temp)
+      - (0.0129 * temp)
+      + 1.3216;
+  }
+
+  // ===== 85% RH CURVE =====
+  else {
+
+    factor =
+      (0.00003 * temp * temp)
+      - (0.0114 * temp)
+      + 1.147;
+  }
+
+  return factor;
+}
+
+// ================= Corrected ADC =================
+float getCorrectedADC(float rawADC, float temp, float hum) {
+
+  float factor = getCompensationFactor(temp, hum);
+
+  return rawADC / factor;
+}
+
+// ================= UART MODEM =================
+#define MODEM_RX 16
+#define MODEM_TX 17
+
+HardwareSerial SerialAT(2);
+
+// ================= APN =================
+const char apn[] = "v-internet";
+//const char apn[] = "m3-world";
+const char user[] = "";
+const char pass[] = "";
+
+// ================= MQTT =================
+const char* broker =
+"broker.hivemq.com";
+
+const char* topic =
+"dat/envmonitor/device1/data";
+
+// ================= OBJECT =================
+TinyGsm modem(SerialAT);
+
+TinyGsmClient client(modem);
+
+PubSubClient mqtt(client);
+
+void connectMQTT() {
+  if (mqtt.connect("clientID")) {
+    Serial.println("MQTT connected");
+  }
+}
+
+// ================= SIM WATCHDOG =================
+#define SIM_MAX_RETRIES   3       // So lan thu ket noi lai truoc khi restart modem
+#define SIM_RETRY_DELAY   5000    // Cho 5s giua moi lan thu (ms)
+#define SIM_RESTART_DELAY 10000   // Cho 10s sau khi restart modem (ms)
+
+bool reconnectSIM() {
+  for (int attempt = 1; attempt <= SIM_MAX_RETRIES; attempt++) {
+    Serial.print("[SIM] Thu ket noi lai lan ");
+    Serial.print(attempt);
+    Serial.print("/");
+    Serial.println(SIM_MAX_RETRIES);
+
+    // Buoc 1: Thu ket noi GPRS truc tiep neu van co mang
+    if (modem.isNetworkConnected()) {
+      if (modem.gprsConnect(apn, user, pass)) {
+        Serial.println("[SIM] GPRS ket noi lai thanh cong!");
+        syncTime();
+        return true;
+      }
+    }
+
+    // Buoc 2: Cho dang ky mang roi thu GPRS
+    Serial.println("[SIM] Thu dang ky mang lai...");
+    modem.waitForNetwork(10000);
+
+    if (modem.gprsConnect(apn, user, pass)) {
+      Serial.println("[SIM] GPRS ket noi lai thanh cong sau waitForNetwork!");
+      syncTime();
+      return true;
+    }
+
+    if (attempt < SIM_MAX_RETRIES) {
+      vTaskDelay(SIM_RETRY_DELAY / portTICK_PERIOD_MS);
+    }
+  }
+
+  // Het retry -> restart modem
+  Serial.println("[SIM] Het so lan thu, dang RESTART modem...");
+  modem.restart();
+  vTaskDelay(SIM_RESTART_DELAY / portTICK_PERIOD_MS);
+
+  Serial.println("[SIM] Thu lai sau khi restart...");
+  modem.waitForNetwork(15000);
+
+  if (modem.gprsConnect(apn, user, pass)) {
+    Serial.println("[SIM] Ket noi lai thanh cong sau restart modem!");
+    syncTime();
+    return true;
+  }
+
+  Serial.println("[SIM] Van khong ket noi duoc sau restart modem!");
+  return false;
+}
+
+unsigned long getTimeFromSIM(String &readableTime) {
+
+  String timeStr = modem.getGSMDateTime(DATE_FULL);
+
+  Serial.print("Raw time: ");
+  Serial.println(timeStr);
+
+  // Check lỗi
+  if (timeStr.length() < 17) {
+    Serial.println("Time invalid!");
+    readableTime = "invalid";
+    return 0;
+  }
+
+  // Parse
+  int year = timeStr.substring(0, 2).toInt() + 2000;
+  int month = timeStr.substring(3, 5).toInt();
+  int day = timeStr.substring(6, 8).toInt();
+  int hour = timeStr.substring(9, 11).toInt();
+  int min = timeStr.substring(12, 14).toInt();
+  int sec = timeStr.substring(15, 17).toInt();
+
+  // Tạo struct time
+  tmElements_t tm;
+  tm.Year = CalendarYrToTm(year);
+  tm.Month = month;
+  tm.Day = day;
+  tm.Hour = hour;
+  tm.Minute = min;
+  tm.Second = sec;
+
+  // Epoch (UTC)
+  unsigned long epoch = makeTime(tm) - 7 * 3600;
+
+  // String hiển thị (giờ VN)
+  char buffer[25];
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+          year, month, day, hour, min, sec);
+
+  readableTime = String(buffer);
+
+  return epoch;
+}
+
+void syncTime() {
+  baseEpoch = getTimeFromSIM(updateTimeStr);
+  baseMillis = millis();
+}
+
+unsigned long getCurrentTimestamp() {
+  if (baseEpoch == 0) return 0;
+  return baseEpoch + (millis() - baseMillis) / 1000;
+}
+
+String convertTimestampToString(unsigned long timestamp) {
+
+  time_t raw = timestamp + 7 * 3600; // giờ VN
+
+  int y = year(raw);
+  int m = month(raw);
+  int d = day(raw);
+  int h = hour(raw);
+  int min = minute(raw);
+  int s = second(raw);
+
+  char buffer[25];
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+          y, m, d, h, min, s);
+
+  return String(buffer);
+}
+
+
+
+void TaskSensors(void *pvParameters) {
+  RawData data;
+
+  while (1) {
+
+    // Read AHT10 temperature and humidity
+    sensors_event_t humidity, temp;
+    aht.getEvent(&humidity, &temp);
+    data.temp   = temp.temperature;
+    data.hum    = humidity.relative_humidity;
+
+    // Read MQ135 (averaged ADC)
+    data.rawGas = readMQ135ADC();
+
+    // Read dust sensor
+    data.dust   = dustSensor.read();
+
+    xQueueOverwrite(rawQueue, &data);
+
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
+}
+
+void TaskProcessing(void *pvParameters) {
+  RawData raw;
+  ProcessedData data;
+
+  while (1) {
+
+    if (xQueueReceive(rawQueue, &raw, portMAX_DELAY)) {
+
+      // ===== MQ135 =====
+      float correctedADC = getCorrectedADC(raw.rawGas, raw.temp, raw.hum);
+      data.gasIndex = getGasIndex(correctedADC);
+      data.gasLevel = getGasLevel(data.gasIndex);
+
+      // ===== DUST → AQI =====
+      data.aqi = convertPM25ToAQI(raw.dust);
+      data.aqiLevel = getAQILevel(data.aqi);
+
+      // ===== PASS THROUGH =====
+      data.temp = raw.temp;
+      data.hum  = raw.hum;
+      data.dust = raw.dust;
+
+      xQueueOverwrite(processedQueue, &data);
+    }
+  }
+}
+
+void TaskMQTT(void *pvParameters) {
+  ProcessedData data;
+
+  while (1) {
+    // Kiem tra ket noi mang / GPRS, goi watchdog neu mat ket noi
+    if (!modem.isNetworkConnected() || !modem.isGprsConnected()) {
+      Serial.println("[MQTT] Mat ket noi mang, goi watchdog...");
+      reconnectSIM();
+    }
+
+    // Ket noi lai MQTT neu bi ngat
+    if (!mqtt.connected()) {
+      Serial.println("[MQTT] Mat ket noi MQTT, dang ket noi lai...");
+      connectMQTT();
+    }
+
+    mqtt.loop(); // cực quan trọng
+
+    if (xQueuePeek(processedQueue, &data, 0) == pdTRUE) {
+
+      unsigned long timestamp = getCurrentTimestamp();
+
+      // ================= JSON =================
+  StaticJsonDocument<300> doc;
+
+  doc["temp"]      = String(data.temp, 2);
+  doc["hum"]       = String(data.hum, 2);
+  doc["gasIndex"]  = String(data.gasIndex, 2);
+  doc["aqi"]       = data.aqi;
+  doc["timestamp"] = (long)timestamp;
+  doc["lastUpdate"] = updateTimeStr;
+  char buffer[256];
+
+  serializeJson(doc, buffer);
+
+  // ================= MQTT PUBLISH =================
+  mqtt.publish(topic, buffer);
+
+  Serial.println("Đã gửi MQTT:");
+  Serial.println(buffer);
+
+  Serial.println("------------------");
+    }
+
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+  }
+}
+
+
+void setup() {
+  
+  Serial.begin(115200);
+
+  delay(10);
+
+  // ================= Dust sensor =================
+  dustSensor.begin();
+
+  // ================= MQ135 =================
+  pinMode(MQ135_PIN, INPUT);
+
+  // ================= AHT10 =================
+  Wire.begin(21, 22);
+
+  if (!aht.begin()) {
+
+    Serial.println("Không tìm thấy AHT10!");
+
+    while (1);
+  }
+
+  Serial.println("AHT10 OK");
+
+  // ================= MODEM =================
+  SerialAT.begin(115200, SERIAL_8N1,
+                 MODEM_RX, MODEM_TX);
+
+  delay(2000);
+
+  // Vong lap khoi dong modem: thu mai den khi thanh cong
+  while (true) {
+    Serial.println("Khoi dong modem...");
+    modem.restart();
+    delay(2000);
+
+    // --- Cho dang ky mang, thu toi da 3 lan ---
+    bool networkOK = false;
+    for (int i = 1; i <= 3; i++) {
+      Serial.print("Dang ket noi mang... lan ");
+      Serial.println(i);
+      if (modem.waitForNetwork(30000)) {
+        networkOK = true;
+        Serial.println("Mang OK");
+        break;
+      }
+      Serial.println("Chua co mang, thu lai...");
+    }
+
+    if (!networkOK) {
+      Serial.println("Khong co mang sau 3 lan thu -> restart modem...");
+      continue; // quay lai dau vong lap, restart modem
+    }
+
+    // --- Ket noi GPRS, thu toi da 3 lan ---
+    bool gprsOK = false;
+    for (int i = 1; i <= 3; i++) {
+      Serial.print("Dang ket noi GPRS... lan ");
+      Serial.println(i);
+      if (modem.gprsConnect(apn, user, pass)) {
+        gprsOK = true;
+        Serial.println("GPRS connected!");
+        break;
+      }
+      Serial.println("GPRS fail, thu lai...");
+      delay(3000);
+    }
+
+    if (!gprsOK) {
+      Serial.println("GPRS that bai sau 3 lan thu -> restart modem...");
+      continue; // quay lai dau vong lap, restart modem
+    }
+
+    break; // Thanh cong, thoat vong lap
+  }
+  syncTime();
+  // ================= Setup time =================
+  // ================= MQTT =================
+  mqtt.setServer(broker, 1883);
+
+  connectMQTT();
+
+  rawQueue = xQueueCreate(1, sizeof(RawData));
+  processedQueue = xQueueCreate(1, sizeof(ProcessedData));
+
+  xTaskCreatePinnedToCore(TaskSensors, "Sensors", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskProcessing, "Processing", 4096, NULL, 1, NULL, 1);
+
+  xTaskCreatePinnedToCore(TaskMQTT, "MQTT", 4096, NULL, 2, NULL, 0);
+  // TaskFirebase removed — not implemented in this file
+
+}
+
+void loop() {
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+}
