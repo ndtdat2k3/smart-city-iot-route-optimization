@@ -1,3 +1,4 @@
+
 #define TINY_GSM_MODEM_SIM7600
 
 #include <Arduino.h>
@@ -9,530 +10,603 @@
 #include "GP2Y1010AU0F.h"
 #include "time.h"
 #include <TimeLib.h>
+#include "esp_task_wdt.h"
 
-Adafruit_AHTX0 aht;
+// ================= SENSOR PINS =================
+#define MQ135_PIN  34
+#define measurePin 35
+#define ledPin     25
 
-
-typedef struct {
-  float temp;
-  float hum;
-  float rawGas;
-  float dust;
-} RawData;
-
-typedef struct {
-  float temp;
-  float hum;
-
-  float gasIndex;
-  const char* gasLevel;
-
-  int aqi;
-  const char* aqiLevel;
-
-  float dust;
-} ProcessedData;
-
-QueueHandle_t rawQueue;
-QueueHandle_t processedQueue;
-
-// ================= DEFINE =================
-#define MQ135_PIN 34  
-#define measurePin 35   // Connect dust sensor analog measure pin to G35 pin
-#define ledPin 25    // Connect dust sensor LED pin to Arduino pin 2
-
-const float baselineADC = 1050;
-GP2Y1010AU0F dustSensor(ledPin, measurePin); // Construct dust sensor global object
-float dustDensity = 0;
-
-unsigned long baseEpoch = 0;
-unsigned long baseMillis = 0;
-String updateTimeStr = "";
-
-// ================= CONVERT PM2.5 TO AQI =================
-int convertPM25ToAQI(float pm25) {
-  float C = pm25;
-  float Clow, Chigh;
-  int Ilow, Ihigh;
-
-  if (C <= 12.0) {
-    Clow = 0.0; Chigh = 12.0;
-    Ilow = 0; Ihigh = 50;
-  }
-  else if (C <= 35.4) {
-    Clow = 12.1; Chigh = 35.4;
-    Ilow = 51; Ihigh = 100;
-  }
-  else if (C <= 55.4) {
-    Clow = 35.5; Chigh = 55.4;
-    Ilow = 101; Ihigh = 150;
-  }
-  else if (C <= 150.4) {
-    Clow = 55.5; Chigh = 150.4;
-    Ilow = 151; Ihigh = 200;
-  }
-  else if (C <= 250.4) {
-    Clow = 150.5; Chigh = 250.4;
-    Ilow = 201; Ihigh = 300;
-  }
-  else {
-    return 300; // vượt ngưỡng
-  }
-
-  float AQI = (Ihigh - Ilow) * (C - Clow) / (Chigh - Clow) + Ilow;
-  return (int)AQI;
-}
-
-// ================= AQI LEVEL =================
-const char* getAQILevel(int aqi) {
-  if (aqi <= 50) return "Good";
-  else if (aqi <= 100) return "Moderate";
-  else if (aqi <= 150) return "Unhealthy for Sensitive Groups";
-  else if (aqi <= 200) return "Unhealthy";
-  else return "Very Unhealthy";
-}
-
-// ================= READ FILTERED ADC =================
-float readMQ135ADC(int samples = 20) {
-
-  float sum = 0;
-
-  for(int i = 0; i < samples; i++) {
-
-    sum += analogRead(MQ135_PIN);
-
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-
-  return sum / samples;
-}
-
-// ================= CALCULATE GAS INDEX =================
-float getGasIndex(float correctedADC) {
-
-  return correctedADC / baselineADC;
-}
-
-// ================= CLASSIFY AIR QUALITY =================
-const char* getGasLevel(float index) {
-
-  if(index < 1.25) {
-    return "GOOD";
-  }
-
-  else if(index < 1.70) {
-    return "MODERATE";
-  }
-
-  else if(index < 2.50) {
-    return "UNHEALTHY_FOR_SENSITIVE_GROUPS";
-  }
-
-  else if(index < 3.20) {
-    return "UNHEALTHY";
-  }
-
-  else {
-    return "HAZARDOUS";
-  }
-}
-
-// ================= MQ135 TEMP/HUM COMPENSATION =================
-float getCompensationFactor(float temp, float hum) {
-
-  float factor = 1.0;
-
-  // ===== 30% RH CURVE =====
-  if(hum < 45) {
-
-    factor =
-      (0.00004 * temp * temp)
-      - (0.0154 * temp)
-      + 1.5538;
-  }
-
-  // ===== 60% RH CURVE =====
-  else if(hum < 72) {
-
-    factor =
-      (0.00002 * temp * temp)
-      - (0.0129 * temp)
-      + 1.3216;
-  }
-
-  // ===== 85% RH CURVE =====
-  else {
-
-    factor =
-      (0.00003 * temp * temp)
-      - (0.0114 * temp)
-      + 1.147;
-  }
-
-  return factor;
-}
-
-// ================= Corrected ADC =================
-float getCorrectedADC(float rawADC, float temp, float hum) {
-
-  float factor = getCompensationFactor(temp, hum);
-
-  return rawADC / factor;
-}
+// ================= UART CAM =================
+#define CAM_UART_RX   19
+#define CAM_UART_TX   18
+#define CAM_UART_BAUD 460800
+#define CAM_IMG_BUF_SIZE (40 * 1024)
 
 // ================= UART MODEM =================
 #define MODEM_RX 16
 #define MODEM_TX 17
 
-HardwareSerial SerialAT(2);
+// ================= APN / MQTT =================
+const char apn[]    = "v-internet";
+const char user[]   = "";
+const char pass[]   = "";
+const char* broker  = "broker.hivemq.com";
+const char* topic   = "dat/envmonitor/device1/data";
 
-// ================= APN =================
-const char apn[] = "v-internet";
-//const char apn[] = "m3-world";
-const char user[] = "";
-const char pass[] = "";
+// ================= GLOBALS =================
+Adafruit_AHTX0    aht;
+HardwareSerial    SerialCAM(1);
+HardwareSerial    SerialAT(2);
+TinyGsm           modem(SerialAT);
+TinyGsmClient     gsmClient(modem, 0);  // [FIX] mux 0: danh rieng cho MQTT
+TinyGsmClient     httpCli(modem, 1);    // [FIX] mux 1: danh rieng cho YOLO HTTP
+                                        //   -> httpCli.stop() khong dong nham socket MQTT
+PubSubClient      mqtt(gsmClient);
 
-// ================= MQTT =================
-const char* broker =
-"broker.hivemq.com";
+GP2Y1010AU0F dustSensor(ledPin, measurePin);
+const float  baselineADC = 1050;
 
-const char* topic =
-"dat/envmonitor/device1/data";
+unsigned long baseEpoch  = 0;
+unsigned long baseMillis = 0;
+String        updateTimeStr = "";
 
-// ================= OBJECT =================
-TinyGsm modem(SerialAT);
+// [FIX] Dung char array thay String de tranh race condition
+//       Chi TaskModem duoc phep doc/ghi serverUrl
+//       loop() gui URL moi qua urlQueue
+char          serverUrl[128] = "http://unneedy-presymptomatic-tenley.ngrok-free.dev";
+QueueHandle_t urlQueue;   // item type: char[128]
 
-TinyGsmClient client(modem);
+// ================= SHARED DATA =================
+typedef struct {
+  float temp, hum, rawGas, dust;
+} RawData;
 
-PubSubClient mqtt(client);
+typedef struct {
+  float temp, hum, gasIndex, dust;
+  char  gasLevel[40];
+  int   aqi;
+  char  aqiLevel[40];
+} ProcessedData;
 
-void connectMQTT() {
-  if (mqtt.connect("clientID")) {
-    Serial.println("MQTT connected");
-  }
+typedef struct {
+  int  vehicleCount;
+  int  laneCount;
+  bool valid;
+} VehicleData;
+
+QueueHandle_t     rawQueue;
+QueueHandle_t     processedQueue;
+SemaphoreHandle_t camImgMutex;
+
+uint8_t*   camImgBuf   = nullptr;
+size_t     camImgLen   = 0;
+volatile bool camImgReady = false;
+
+VehicleData latestVehicle = {0, 0, false};
+
+// ================================================================
+//  HELPER FUNCTIONS
+// ================================================================
+int convertPM25ToAQI(float pm25) {
+  if (pm25 <= 12.0)  return (int)((50.0/12.0) * pm25);
+  if (pm25 <= 35.4)  return (int)(50 + (50.0/23.4)  * (pm25 - 12.1));
+  if (pm25 <= 55.4)  return (int)(100 + (50.0/19.9)  * (pm25 - 35.5));
+  if (pm25 <= 150.4) return (int)(150 + (50.0/94.9)  * (pm25 - 55.5));
+  if (pm25 <= 250.4) return (int)(200 + (100.0/99.9) * (pm25 - 150.5));
+  return 300;
 }
 
-// ================= SIM WATCHDOG =================
-#define SIM_MAX_RETRIES   3       // So lan thu ket noi lai truoc khi restart modem
-#define SIM_RETRY_DELAY   5000    // Cho 5s giua moi lan thu (ms)
-#define SIM_RESTART_DELAY 10000   // Cho 10s sau khi restart modem (ms)
-
-bool reconnectSIM() {
-  for (int attempt = 1; attempt <= SIM_MAX_RETRIES; attempt++) {
-    Serial.print("[SIM] Thu ket noi lai lan ");
-    Serial.print(attempt);
-    Serial.print("/");
-    Serial.println(SIM_MAX_RETRIES);
-
-    // Buoc 1: Thu ket noi GPRS truc tiep neu van co mang
-    if (modem.isNetworkConnected()) {
-      if (modem.gprsConnect(apn, user, pass)) {
-        Serial.println("[SIM] GPRS ket noi lai thanh cong!");
-        syncTime();
-        return true;
-      }
-    }
-
-    // Buoc 2: Cho dang ky mang roi thu GPRS
-    Serial.println("[SIM] Thu dang ky mang lai...");
-    modem.waitForNetwork(10000);
-
-    if (modem.gprsConnect(apn, user, pass)) {
-      Serial.println("[SIM] GPRS ket noi lai thanh cong sau waitForNetwork!");
-      syncTime();
-      return true;
-    }
-
-    if (attempt < SIM_MAX_RETRIES) {
-      vTaskDelay(SIM_RETRY_DELAY / portTICK_PERIOD_MS);
-    }
-  }
-
-  // Het retry -> restart modem
-  Serial.println("[SIM] Het so lan thu, dang RESTART modem...");
-  modem.restart();
-  vTaskDelay(SIM_RESTART_DELAY / portTICK_PERIOD_MS);
-
-  Serial.println("[SIM] Thu lai sau khi restart...");
-  modem.waitForNetwork(15000);
-
-  if (modem.gprsConnect(apn, user, pass)) {
-    Serial.println("[SIM] Ket noi lai thanh cong sau restart modem!");
-    syncTime();
-    return true;
-  }
-
-  Serial.println("[SIM] Van khong ket noi duoc sau restart modem!");
-  return false;
+const char* getAQILevel(int aqi) {
+  if (aqi <= 50)  return "Good";
+  if (aqi <= 100) return "Moderate";
+  if (aqi <= 150) return "Unhealthy for Sensitive Groups";
+  if (aqi <= 200) return "Unhealthy";
+  return "Very Unhealthy";
 }
 
-unsigned long getTimeFromSIM(String &readableTime) {
-
-  String timeStr = modem.getGSMDateTime(DATE_FULL);
-
-  Serial.print("Raw time: ");
-  Serial.println(timeStr);
-
-  // Check lỗi
-  if (timeStr.length() < 17) {
-    Serial.println("Time invalid!");
-    readableTime = "invalid";
-    return 0;
+float readMQ135ADC(int samples = 20) {
+  float sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(MQ135_PIN);
+    delay(10);
   }
+  return sum / samples;
+}
 
-  // Parse
-  int year = timeStr.substring(0, 2).toInt() + 2000;
-  int month = timeStr.substring(3, 5).toInt();
-  int day = timeStr.substring(6, 8).toInt();
-  int hour = timeStr.substring(9, 11).toInt();
-  int min = timeStr.substring(12, 14).toInt();
-  int sec = timeStr.substring(15, 17).toInt();
+float getGasIndex(float adc)       { return adc / baselineADC; }
 
-  // Tạo struct time
+const char* getGasLevel(float idx) {
+  if (idx < 1.25) return "GOOD";
+  if (idx < 1.70) return "MODERATE";
+  if (idx < 2.30) return "UNHEALTHY_FOR_SENSITIVE_GROUPS";
+  if (idx < 3.20) return "UNHEALTHY";
+  return "HAZARDOUS";
+}
+
+float getCompensationFactor(float t, float h) {
+  if (h < 45) return 0.00004*t*t - 0.0154*t + 1.5538;
+  if (h < 72) return 0.00002*t*t - 0.0129*t + 1.3216;
+  return        0.00003*t*t - 0.0114*t + 1.147;
+}
+
+float getCorrectedADC(float raw, float t, float h) {
+  return raw / getCompensationFactor(t, h);
+}
+
+// ================= TIME =================
+unsigned long getTimeFromSIM(String &readable) {
+  String s = modem.getGSMDateTime(DATE_FULL);
+  Serial.print("Raw time: "); Serial.println(s);
+  if (s.length() < 17) { readable = "invalid"; return 0; }
+  int y = s.substring(0,2).toInt()+2000, mo = s.substring(3,5).toInt();
+  int d = s.substring(6,8).toInt(),  h  = s.substring(9,11).toInt();
+  int mi= s.substring(12,14).toInt(), se = s.substring(15,17).toInt();
   tmElements_t tm;
-  tm.Year = CalendarYrToTm(year);
-  tm.Month = month;
-  tm.Day = day;
-  tm.Hour = hour;
-  tm.Minute = min;
-  tm.Second = sec;
-
-  // Epoch (UTC)
-  unsigned long epoch = makeTime(tm) - 7 * 3600;
-
-  // String hiển thị (giờ VN)
-  char buffer[25];
-  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
-          year, month, day, hour, min, sec);
-
-  readableTime = String(buffer);
-
+  tm.Year=CalendarYrToTm(y); tm.Month=mo; tm.Day=d;
+  tm.Hour=h; tm.Minute=mi; tm.Second=se;
+  unsigned long epoch = makeTime(tm) - 7*3600;
+  char buf[25];
+  sprintf(buf,"%04d-%02d-%02d %02d:%02d:%02d",y,mo,d,h,mi,se);
+  readable = String(buf);
   return epoch;
 }
 
 void syncTime() {
-  baseEpoch = getTimeFromSIM(updateTimeStr);
+  baseEpoch  = getTimeFromSIM(updateTimeStr);
   baseMillis = millis();
 }
 
 unsigned long getCurrentTimestamp() {
-  if (baseEpoch == 0) return 0;
+  if (!baseEpoch) return 0;
   return baseEpoch + (millis() - baseMillis) / 1000;
 }
 
-String convertTimestampToString(unsigned long timestamp) {
-
-  time_t raw = timestamp + 7 * 3600; // giờ VN
-
-  int y = year(raw);
-  int m = month(raw);
-  int d = day(raw);
-  int h = hour(raw);
-  int min = minute(raw);
-  int s = second(raw);
-
-  char buffer[25];
-  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
-          y, m, d, h, min, s);
-
-  return String(buffer);
+String convertTimestampToString(unsigned long ts) {
+  time_t raw = ts + 7*3600;
+  char buf[25];
+  sprintf(buf,"%04d-%02d-%02d %02d:%02d:%02d",
+          year(raw),month(raw),day(raw),hour(raw),minute(raw),second(raw));
+  return String(buf);
 }
 
+// ================= MODEM / MQTT =================
+bool reconnectSIM() {
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("[SIM] Thu ket noi lai lan %d/3\n", attempt);
+    delay(100);
+    if (modem.isNetworkConnected() && modem.gprsConnect(apn,user,pass)) {
+      Serial.println("[SIM] GPRS OK!");
+      syncTime();
+      return true;
+    }
+    Serial.println("[SIM] Cho mang...");
+    bool netOK = false;
+    for (int w = 0; w < 10; w++) {
+      delay(1000);
+      if (modem.isNetworkConnected()) { netOK = true; break; }
+    }
+    if (netOK && modem.gprsConnect(apn,user,pass)) {
+      Serial.println("[SIM] GPRS OK sau wait!");
+      syncTime();
+      return true;
+    }
+    if (attempt < 3) delay(5000);
+  }
+  Serial.println("[SIM] Restart modem...");
+  modem.restart();
+  delay(10000);
+  for (int w = 0; w < 15; w++) {
+    delay(1000);
+    if (modem.isNetworkConnected() && modem.gprsConnect(apn,user,pass)) {
+      Serial.println("[SIM] OK sau restart!");
+      syncTime();
+      return true;
+    }
+  }
+  return false;
+}
 
+void connectMQTT() {
+  for (int i = 1; i <= 5; i++) {
+    if (mqtt.connect("ESP32_EnvMonitor")) {
+      Serial.println("[MQTT] Connected!");
+      return;
+    }
+    Serial.printf("[MQTT] Thu lan %d/5...\n", i);
+    delay(3000);
+  }
+  Serial.println("[MQTT] Khong ket noi duoc!");
+}
 
+// ================= YOLO HTTP =================
+// [FIX] Nhan them tham so urlStr thay vi doc truc tiep tu global serverUrl
+//       -> tranh race condition, moi thu chi trong pham vi ham nay
+bool doYoloRequest(uint8_t* imgBuf, size_t imgLen, const char* urlStr) {
+  // Sao chep vao String cuc bo de xu ly
+  String url = String(urlStr);
+  url.replace("https://",""); url.replace("http://","");
+  int si = url.indexOf('/');
+  String hostPort = (si > 0) ? url.substring(0, si) : url;
+  String path     = (si > 0) ? url.substring(si) + "/predict" : "/predict";
+  if (path.endsWith("/predict/predict")) path = "/predict";
+  String host = hostPort;
+  int    port = 80;
+  int ci = hostPort.indexOf(':');
+  if (ci > 0) { host = hostPort.substring(0,ci); port = hostPort.substring(ci+1).toInt(); }
+
+  Serial.printf("[YOLO] POST %s:%d%s (%u bytes)\n", host.c_str(), port, path.c_str(), imgLen);
+
+  // Kiem tra JPEG header
+  if (imgLen < 4 || imgBuf[0] != 0xFF || imgBuf[1] != 0xD8) {
+    Serial.printf("[YOLO] JPEG header loi: %02X %02X\n", imgBuf[0], imgBuf[1]);
+    return false;
+  }
+
+  // Dung global httpCli (tranh destructor crash khi local object bi destroy)
+  httpCli.stop(); // dam bao socket cu da dong
+  httpCli.setTimeout(15000);
+  if (!httpCli.connect(host.c_str(), port)) {
+    Serial.println("[YOLO] Khong connect duoc!");
+    return false;
+  }
+
+  // GUI HTTP POST
+  httpCli.printf(
+    "POST %s HTTP/1.1\r\nHost: %s\r\n"
+    "Content-Type: image/jpeg\r\n"
+    "Content-Length: %d\r\n"
+    "Connection: close\r\n\r\n",
+    path.c_str(), host.c_str(), (int)imgLen
+  );
+  // Gui anh theo block 1KB voi bounds check
+  size_t sent = 0;
+  while (sent < imgLen) {
+    size_t blk = min((size_t)1024, imgLen - sent);
+    if (sent + blk > imgLen) blk = imgLen - sent; // paranoia check
+    httpCli.write(imgBuf + sent, blk);
+    sent += blk;
+    mqtt.loop();
+  }
+  Serial.printf("[YOLO] Da gui %u/%u bytes\n", sent, imgLen);
+
+  // Doc response
+  // [FIX] delay(100) -> vTaskDelay: dang trong FreeRTOS task, phai dung vTaskDelay
+  //       delay() trong task co the khong feed WDT dung -> reset
+  unsigned long t0 = millis();
+  while (!httpCli.available() && millis()-t0 < 15000) vTaskDelay(100 / portTICK_PERIOD_MS);
+
+  int    httpCode   = 0;
+  String body       = "";
+  bool   bodyStart  = false;
+  while (httpCli.available()) {
+    String line = httpCli.readStringUntil('\n');
+    line.trim();
+    if (!httpCode && line.startsWith("HTTP/")) {
+      int s1=line.indexOf(' '), s2=line.indexOf(' ',s1+1);
+      if (s1>0&&s2>0) httpCode=line.substring(s1+1,s2).toInt();
+    } else if (!bodyStart && line.length()==0) {
+      bodyStart = true;
+    } else if (bodyStart) {
+      body += line;
+    }
+  }
+  httpCli.stop();
+
+  Serial.printf("[YOLO] HTTP %d | %s\n", httpCode, body.c_str());
+  if (httpCode != 200) return false;
+
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, body)) { Serial.println("[YOLO] JSON loi!"); return false; }
+  latestVehicle.vehicleCount = doc["vehicle_count"] | 0;
+  latestVehicle.laneCount    = doc["lane_count"]    | 0;
+  latestVehicle.valid        = true;
+  Serial.printf("[YOLO] Xe: %d | Lane: %d\n",
+                latestVehicle.vehicleCount, latestVehicle.laneCount);
+  Serial.printf("[DEBUG] TaskModem stack con lai: %d bytes\n",
+                uxTaskGetStackHighWaterMark(NULL));
+  return true;
+}
+
+// ================================================================
+//  TASK SENSORS  (CPU 1)
+// ================================================================
 void TaskSensors(void *pvParameters) {
   RawData data;
-
   while (1) {
-
-    // Read AHT10 temperature and humidity
-    sensors_event_t humidity, temp;
-    aht.getEvent(&humidity, &temp);
-    data.temp   = temp.temperature;
-    data.hum    = humidity.relative_humidity;
-
-    // Read MQ135 (averaged ADC)
+    sensors_event_t hev, tev;
+    aht.getEvent(&hev, &tev);
+    data.temp   = tev.temperature;
+    data.hum    = hev.relative_humidity;
     data.rawGas = readMQ135ADC();
-
-    // Read dust sensor
     data.dust   = dustSensor.read();
-
     xQueueOverwrite(rawQueue, &data);
-
     vTaskDelay(2000 / portTICK_PERIOD_MS);
   }
 }
 
+// ================================================================
+//  TASK PROCESSING  (CPU 1)
+// ================================================================
 void TaskProcessing(void *pvParameters) {
-  RawData raw;
-  ProcessedData data;
-
+  RawData raw; ProcessedData out;
   while (1) {
-
     if (xQueueReceive(rawQueue, &raw, portMAX_DELAY)) {
-
-      // ===== MQ135 =====
-      float correctedADC = getCorrectedADC(raw.rawGas, raw.temp, raw.hum);
-      data.gasIndex = getGasIndex(correctedADC);
-      data.gasLevel = getGasLevel(data.gasIndex);
-
-      // ===== DUST → AQI =====
-      data.aqi = convertPM25ToAQI(raw.dust);
-      data.aqiLevel = getAQILevel(data.aqi);
-
-      // ===== PASS THROUGH =====
-      data.temp = raw.temp;
-      data.hum  = raw.hum;
-      data.dust = raw.dust;
-
-      xQueueOverwrite(processedQueue, &data);
+      float corrADC  = getCorrectedADC(raw.rawGas, raw.temp, raw.hum);
+      out.gasIndex   = getGasIndex(corrADC);
+      strncpy(out.gasLevel, getGasLevel(out.gasIndex), sizeof(out.gasLevel)-1);
+      out.gasLevel[sizeof(out.gasLevel)-1] = '\0';
+      out.aqi        = convertPM25ToAQI(raw.dust);
+      strncpy(out.aqiLevel, getAQILevel(out.aqi), sizeof(out.aqiLevel)-1);
+      out.aqiLevel[sizeof(out.aqiLevel)-1] = '\0';
+      out.temp = raw.temp; out.hum = raw.hum; out.dust = raw.dust;
+      xQueueOverwrite(processedQueue, &out);
     }
   }
 }
 
-void TaskMQTT(void *pvParameters) {
-  ProcessedData data;
+// ================================================================
+//  TASK CAM RECEIVE  (CPU 1, priority cao nhat)
+// ================================================================
+void TaskCAMReceive(void *pvParameters) {
+  while (1) {
+    if (!SerialCAM.available()) { vTaskDelay(5/portTICK_PERIOD_MS); continue; }
+
+    String hdr = SerialCAM.readStringUntil('\n'); hdr.trim();
+    if (!hdr.startsWith("START:")) continue;
+
+    size_t expected = hdr.substring(6).toInt();
+    if (!expected || expected > CAM_IMG_BUF_SIZE) {
+      Serial.printf("[CAM RX] Size khong hop le: %u\n", expected); continue;
+    }
+    Serial.printf("[CAM RX] Bat dau nhan anh: %u bytes\n", expected);
+
+    size_t got = 0;
+    unsigned long last = millis();
+    while (millis()-last < 3000) {
+      if (!SerialCAM.available()) { vTaskDelay(1/portTICK_PERIOD_MS); continue; }
+      String line = SerialCAM.readStringUntil('\n'); line.trim();
+      last = millis();
+      if (line == "END") break;
+      if (!line.startsWith("CHUNK:")) continue;
+      String hex = line.substring(6);
+      for (size_t i=0; i+1<hex.length(); i+=2) {
+        if (got < CAM_IMG_BUF_SIZE) {
+          uint8_t hi = hex[i],   lo = hex[i+1];
+          hi = (hi>='A') ? hi-'A'+10 : hi-'0';
+          lo = (lo>='A') ? lo-'A'+10 : lo-'0';
+          camImgBuf[got++] = (hi<<4)|lo;
+        }
+      }
+    }
+
+    if (got == expected) {
+      if (xSemaphoreTake(camImgMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        camImgLen   = got;
+        camImgReady = true;
+        xSemaphoreGive(camImgMutex);
+      }
+      Serial.printf("[CAM RX] Hoan chinh: %u bytes -> ACK\n", got);
+      SerialCAM.println("OK");
+    } else {
+      Serial.printf("[CAM RX] Loi: %u / %u bytes\n", got, expected);
+      // Khong ACK -> CAM tu timeout
+    }
+  }
+}
+
+// ================================================================
+//  TASK MODEM  –  1 task duy nhat xu ly MQTT + YOLO  (CPU 0)
+//  Khong co task nao khac dung modem -> khong bao gio xung dot
+// ================================================================
+void TaskModem(void *pvParameters) {
+  esp_task_wdt_delete(NULL);  // [FIX WDT] Gỡ TaskModem khỏi WDT monitor
+                              // TinyGSM/mqtt.connect() block lâu là bình thường
+                              // IDLE task CPU0 vẫn được monitor bình thường
+  
+  ProcessedData sensorData;
+  unsigned long lastPublish = 0;
+  bool          mqttOK      = false;
 
   while (1) {
-    // Kiem tra ket noi mang / GPRS, goi watchdog neu mat ket noi
+    // ---- 0. [FIX] NHAN URL MOI TU loop() NEU CO ----
+    //        Chi TaskModem moi ghi serverUrl -> khong race condition
+    char newUrl[128];
+    if (xQueueReceive(urlQueue, newUrl, 0) == pdTRUE) {
+      strncpy(serverUrl, newUrl, sizeof(serverUrl) - 1);
+      serverUrl[sizeof(serverUrl) - 1] = '\0';
+      Serial.printf("[MODEM] Server URL cap nhat: %s\n", serverUrl);
+    }
+
+    // ---- 1. KIEM TRA MANG ----
     if (!modem.isNetworkConnected() || !modem.isGprsConnected()) {
-      Serial.println("[MQTT] Mat ket noi mang, goi watchdog...");
+      Serial.println("[MODEM] Mat mang, reconnect...");
+      mqttOK = false;
       reconnectSIM();
     }
 
-    // Ket noi lai MQTT neu bi ngat
+    // ---- 2. KIEM TRA MQTT ----
     if (!mqtt.connected()) {
-      Serial.println("[MQTT] Mat ket noi MQTT, dang ket noi lai...");
+      Serial.println("[MODEM] Mat MQTT, reconnect...");
       connectMQTT();
+      mqttOK = mqtt.connected();
     }
 
-    mqtt.loop(); // cực quan trọng
+    // ---- 3. MQTT LOOP (bat buoc truoc moi thu) ----
+    mqtt.loop();
 
-    if (xQueuePeek(processedQueue, &data, 0) == pdTRUE) {
-
-      unsigned long timestamp = getCurrentTimestamp();
-
-      // ================= JSON =================
-  StaticJsonDocument<300> doc;
-
-  doc["temp"]      = String(data.temp, 2);
-  doc["hum"]       = String(data.hum, 2);
-  doc["gasIndex"]  = String(data.gasIndex, 2);
-  doc["aqi"]       = data.aqi;
-  doc["timestamp"] = (long)timestamp;
-  doc["lastUpdate"] = updateTimeStr;
-  char buffer[256];
-
-  serializeJson(doc, buffer);
-
-  // ================= MQTT PUBLISH =================
-  mqtt.publish(topic, buffer);
-
-  Serial.println("Đã gửi MQTT:");
-  Serial.println(buffer);
-
-  Serial.println("------------------");
+    // ---- 4. YOLO – xu ly anh neu co ----
+    bool hasImage = false;
+    if (xSemaphoreTake(camImgMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      hasImage = camImgReady;
+      xSemaphoreGive(camImgMutex);
     }
 
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    // [FIX] Dung strlen/strstr thay vi String::length()/indexOf()
+    //       serverUrl chi duoc doc tai day (tren Core 0, trong TaskModem)
+    if (hasImage && strlen(serverUrl) > 10) {
+      // Cho 50ms dam bao TaskCAMReceive da ghi xong buffer hoan toan
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+
+      // Sao chep anh ra buffer cuc bo
+      uint8_t* localBuf = (uint8_t*)malloc(CAM_IMG_BUF_SIZE + 64); // +64 guard bytes
+      if (localBuf) {
+        size_t localLen = 0;
+        if (xSemaphoreTake(camImgMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+          localLen    = camImgLen;
+          if (localLen > CAM_IMG_BUF_SIZE) localLen = CAM_IMG_BUF_SIZE; // bounds check
+          memcpy(localBuf, camImgBuf, localLen);
+          camImgReady = false;
+          xSemaphoreGive(camImgMutex);
+        }
+        size_t lenToSend = localLen;
+        // [FIX] Truyen serverUrl vao ham thay vi doc tu global ben trong ham
+        doYoloRequest(localBuf, lenToSend, serverUrl);
+        memset(localBuf, 0, 64); // clear guard area truoc khi free
+        free(localBuf);
+        localBuf = nullptr;
+      } else {
+        // Het heap: xoa flag de nhan anh moi
+        Serial.println("[MODEM] Khong du heap cho localBuf!");
+        if (xSemaphoreTake(camImgMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          camImgReady = false;
+          xSemaphoreGive(camImgMutex);
+        }
+      }
+      // Loop lai ngay sau YOLO de MQTT khong bi doi lau
+      mqtt.loop();
+    }
+
+    // ---- 5. PUBLISH MQTT moi 5 giay ----
+    if (millis() - lastPublish >= 5000) {
+      lastPublish = millis();
+      if (xQueuePeek(processedQueue, &sensorData, 0) == pdTRUE) {
+        unsigned long ts = getCurrentTimestamp();
+        StaticJsonDocument<300> doc;
+        doc["temp"]       = String(sensorData.temp, 2);
+        doc["hum"]        = String(sensorData.hum,  2);
+        doc["gasIndex"]   = String(sensorData.gasIndex, 2);
+        doc["aqi"]        = sensorData.aqi;
+        doc["timestamp"]  = (long)ts;
+        doc["lastUpdate"] = convertTimestampToString(ts);
+        if (latestVehicle.valid) {
+          doc["vehicleCount"] = latestVehicle.vehicleCount;
+          doc["laneCount"]    = latestVehicle.laneCount;
+        }
+        char buf[300];
+        serializeJson(doc, buf);
+        if (mqtt.connected()) {
+          mqtt.publish(topic, buf);
+          Serial.println("Da gui MQTT:"); Serial.println(buf);
+          Serial.println("------------------");
+        }
+      }
+    }
+
+    // ---- 6. YIELD 200ms – du cho mqtt.loop() chay ~5 lan/giay ----
+    vTaskDelay(200 / portTICK_PERIOD_MS);
   }
 }
 
-
+// ================================================================
+//  SETUP
+// ================================================================
 void setup() {
-  
   Serial.begin(115200);
+  delay(100);
 
-  delay(10);
-
-  // ================= Dust sensor =================
   dustSensor.begin();
-
-  // ================= MQ135 =================
   pinMode(MQ135_PIN, INPUT);
-
-  // ================= AHT10 =================
   Wire.begin(21, 22);
 
   if (!aht.begin()) {
-
-    Serial.println("Không tìm thấy AHT10!");
-
-    while (1);
+    Serial.println("AHT10 khong tim thay!"); while(1);
   }
-
   Serial.println("AHT10 OK");
 
-  // ================= MODEM =================
-  SerialAT.begin(115200, SERIAL_8N1,
-                 MODEM_RX, MODEM_TX);
-
+  // --- Modem ---
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
   delay(2000);
 
-  // Vong lap khoi dong modem: thu mai den khi thanh cong
   while (true) {
     Serial.println("Khoi dong modem...");
-    modem.restart();
-    delay(2000);
+    modem.restart(); delay(2000);
 
-    // --- Cho dang ky mang, thu toi da 3 lan ---
-    bool networkOK = false;
-    for (int i = 1; i <= 3; i++) {
-      Serial.print("Dang ket noi mang... lan ");
-      Serial.println(i);
-      if (modem.waitForNetwork(30000)) {
-        networkOK = true;
-        Serial.println("Mang OK");
-        break;
-      }
-      Serial.println("Chua co mang, thu lai...");
+    bool netOK = false;
+    for (int i=1; i<=3; i++) {
+      Serial.printf("Ket noi mang... lan %d\n", i);
+      if (modem.waitForNetwork(30000)) { netOK=true; Serial.println("Mang OK"); break; }
+      Serial.println("Chua co mang...");
     }
+    if (!netOK) { Serial.println("Restart modem..."); continue; }
 
-    if (!networkOK) {
-      Serial.println("Khong co mang sau 3 lan thu -> restart modem...");
-      continue; // quay lai dau vong lap, restart modem
-    }
-
-    // --- Ket noi GPRS, thu toi da 3 lan ---
     bool gprsOK = false;
-    for (int i = 1; i <= 3; i++) {
-      Serial.print("Dang ket noi GPRS... lan ");
-      Serial.println(i);
-      if (modem.gprsConnect(apn, user, pass)) {
-        gprsOK = true;
-        Serial.println("GPRS connected!");
-        break;
-      }
-      Serial.println("GPRS fail, thu lai...");
+    for (int i=1; i<=3; i++) {
+      Serial.printf("Ket noi GPRS... lan %d\n", i);
+      if (modem.gprsConnect(apn,user,pass)) { gprsOK=true; Serial.println("GPRS OK!"); break; }
       delay(3000);
     }
-
-    if (!gprsOK) {
-      Serial.println("GPRS that bai sau 3 lan thu -> restart modem...");
-      continue; // quay lai dau vong lap, restart modem
-    }
-
-    break; // Thanh cong, thoat vong lap
+    if (!gprsOK) { Serial.println("GPRS fail, restart..."); continue; }
+    break;
   }
-  syncTime();
-  // ================= Setup time =================
-  // ================= MQTT =================
-  mqtt.setServer(broker, 1883);
 
+  syncTime();
+
+  // --- MQTT ---
+  mqtt.setServer(broker, 1883);
+  mqtt.setSocketTimeout(30);  // [FIX] 30s thay vi 15s: GSM cham, can them thoi gian cho CONNACK
+                              //       Bo setKeepAlive(60) -> giu default 15s cua PubSubClient
   connectMQTT();
 
-  rawQueue = xQueueCreate(1, sizeof(RawData));
+  // --- UART CAM ---
+  SerialCAM.begin(CAM_UART_BAUD, SERIAL_8N1, CAM_UART_RX, CAM_UART_TX);
+  SerialCAM.setRxBufferSize(16384);
+  Serial.println("UART CAM OK");
+
+  camImgBuf = (uint8_t*)malloc(CAM_IMG_BUF_SIZE);
+  if (!camImgBuf) { Serial.println("FATAL: het heap!"); while(1); }
+
+  // --- Queues & Semaphores ---
+  camImgMutex   = xSemaphoreCreateMutex();
+  rawQueue       = xQueueCreate(1, sizeof(RawData));
   processedQueue = xQueueCreate(1, sizeof(ProcessedData));
 
-  xTaskCreatePinnedToCore(TaskSensors, "Sensors", 4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(TaskProcessing, "Processing", 4096, NULL, 1, NULL, 1);
+  // [FIX] Queue chuyen URL tu loop() sang TaskModem (1 slot, item = char[128])
+  urlQueue = xQueueCreate(1, sizeof(char[128]));
 
-  xTaskCreatePinnedToCore(TaskMQTT, "MQTT", 4096, NULL, 2, NULL, 0);
-  // TaskFirebase removed — not implemented in this file
-
+  // CPU 0: TaskModem (quan ly toan bo modem)
+  // CPU 1: Sensor, Processing, CAMReceive, Serial
+  xTaskCreatePinnedToCore(TaskSensors,    "Sensors",    4096,  NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskProcessing, "Processing", 4096,  NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskCAMReceive, "CAMReceive", 8192,  NULL, 5, NULL, 1);
+  xTaskCreatePinnedToCore(TaskSerial,     "Serial",     4096,  NULL, 1, NULL, 1);  // [FIX] Thay loop()
+  xTaskCreatePinnedToCore(TaskModem,      "Modem",      28672, NULL, 2, NULL, 0);  // [FIX] 20480->28672: du cho malloc+String trong doYoloRequest
 }
 
+// ================================================================
+//  LOOP – nhuong CPU hoan toan, logic Serial da chuyen vao TaskSerial
+// ================================================================
 void loop() {
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  vTaskDelay(portMAX_DELAY);  // [FIX] delay(500) -> vTaskDelay: idle task chay duoc, WDT khong timeout
+}
 
+// ================================================================
+//  TASK SERIAL – Nhan lenh SET_SERVER_URL tu Serial Monitor (CPU 1)
+//  [FIX] Tach khoi loop() de tranh readStringUntil block WDT idle task
+// ================================================================
+void TaskSerial(void *pvParameters) {
+  while (1) {
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n'); cmd.trim();
+      if (cmd.startsWith("SET_SERVER_URL:")) {
+        char newUrl[128] = {0};
+        cmd.substring(15).toCharArray(newUrl, sizeof(newUrl));
+        xQueueOverwrite(urlQueue, newUrl);
+        Serial.printf("[CONFIG] URL da gui vao queue: %s\n", newUrl);
+      } else if (cmd == "GET_URL") {
+        Serial.printf("[CONFIG] URL hien tai: %s\n", serverUrl);
+      }
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);  // yield dung cach
+  }
 }
