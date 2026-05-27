@@ -1,0 +1,161 @@
+// ================================================================
+//  ESP32-CAM  –  AI-Thinker (OV2640)
+//  ACK-based: chi gui khi nhan duoc "OK\n" tu WROOM
+// ================================================================
+
+#include "esp_camera.h"
+#include "Arduino.h"
+
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+HardwareSerial SerialWROOM(1);
+#define WROOM_TX_PIN 14
+#define WROOM_RX_PIN 15
+#define UART_BAUD    460800
+
+#define CHUNK_SIZE   256
+#define ACK_TIMEOUT  15000  // cho OK toi da 15s
+
+void initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;
+  config.jpeg_quality = 15;
+  config.fb_count     = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] Init that bai: 0x%x\n", err);
+    while (1) delay(1000);
+  }
+  Serial.println("[CAM] Camera OK");
+}
+
+// Cho ACK "OK\n" tu WROOM trong timeout ms
+bool waitACK(unsigned long timeout_ms) {
+  String line = "";
+  unsigned long start = millis();
+  while (millis() - start < timeout_ms) {
+    while (SerialWROOM.available()) {
+      char c = SerialWROOM.read();
+      if (c == '\n') {
+        line.trim();
+        if (line == "OK") return true;
+        line = "";
+      } else {
+        line += c;
+      }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+void sendImage() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[CAM] Chup anh that bai!");
+    return;
+  }
+
+  size_t imgSize = fb->len;
+  Serial.printf("[CAM] Chup anh: %u bytes\n", imgSize);
+
+  // Xoa buffer UART truoc khi gui
+  while (SerialWROOM.available()) SerialWROOM.read();
+
+  // Gui START
+  SerialWROOM.printf("START:%u\n", imgSize);
+  SerialWROOM.flush();
+  delay(50);
+
+  // Gui tung chunk, khong doi ACK giua cac chunk
+  size_t offset = 0;
+  int chunkIdx  = 0;
+  char hexBuf[CHUNK_SIZE * 2 + 10];
+
+  while (offset < imgSize) {
+    size_t len = min((size_t)CHUNK_SIZE, imgSize - offset);
+
+    int pos = 0;
+    hexBuf[pos++] = 'C'; hexBuf[pos++] = 'H'; hexBuf[pos++] = 'U';
+    hexBuf[pos++] = 'N'; hexBuf[pos++] = 'K'; hexBuf[pos++] = ':';
+    for (size_t i = 0; i < len; i++) {
+      uint8_t b = fb->buf[offset + i];
+      hexBuf[pos++] = "0123456789ABCDEF"[b >> 4];
+      hexBuf[pos++] = "0123456789ABCDEF"[b & 0xF];
+    }
+    hexBuf[pos++] = '\n';
+
+    SerialWROOM.write((uint8_t*)hexBuf, pos);
+    SerialWROOM.flush();
+
+    offset   += len;
+    chunkIdx++;
+    delay(15);
+  }
+
+  // Gui END
+  SerialWROOM.println("END");
+  SerialWROOM.flush();
+
+  Serial.printf("[CAM] Da gui %d chunks, cho ACK...\n", chunkIdx);
+
+  // Cho WROOM xac nhan da nhan du
+  if (waitACK(ACK_TIMEOUT)) {
+    Serial.println("[CAM] WROOM xac nhan OK, cho xu ly...");
+    delay(8000); // 8s: du cho WROOM upload YOLO + MQTT loop
+  } else {
+    Serial.println("[CAM] Timeout ACK, thu lai sau 5s...");
+    delay(5000);
+  }
+
+  esp_camera_fb_return(fb);
+}
+
+void setup() {
+  Serial.begin(115200);
+  SerialWROOM.begin(UART_BAUD, SERIAL_8N1, WROOM_RX_PIN, WROOM_TX_PIN);
+  delay(500);
+  initCamera();
+  Serial.println("[CAM] San sang");
+
+  // Cho WROOM khoi dong xong
+  Serial.println("[CAM] Cho WROOM san sang...");
+  delay(3000);
+}
+
+void loop() {
+  sendImage();
+  // Khong delay them – da co ACK handshake kiem soat toc do
+}
