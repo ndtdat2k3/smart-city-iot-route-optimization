@@ -19,7 +19,7 @@ model = YOLO(MODEL_PATH)
 print("[SERVER] Model san sang!")
 
 # ---- Cac class can dem ----
-VEHICLE_CLASSES = {"car", "motorbike", "truck", "bus", "bicycle"}
+VEHICLE_CLASSES = {"car", "motorbike", "truck", "bus", "bicycle", "vehicle"}
 LANE_CLASSES    = {"lane"}
 
 # ---- Luu anh preview (thread-safe) ----
