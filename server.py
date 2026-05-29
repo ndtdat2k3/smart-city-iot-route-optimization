@@ -20,7 +20,8 @@ print("[SERVER] Model san sang!")
 
 # ---- Cac class can dem ----
 VEHICLE_CLASSES = {"car", "motorbike", "truck", "bus", "bicycle", "vehicle"}
-LANE_CLASSES    = {"lane"}
+LANE_CLASSES    = {"lane", "lane line"}
+BARRIER_CLASSES = {"median barrier"}
 
 # ---- Luu anh preview (thread-safe) ----
 _preview_lock     = threading.Lock()
@@ -93,6 +94,7 @@ def predict():
 
     vehicle_count = 0
     lane_count    = 0
+    barrier_count = 0
     for box in results.boxes:
         cls_id   = int(box.cls[0])
         cls_name = model.names[cls_id].lower()
@@ -100,34 +102,41 @@ def predict():
             vehicle_count += 1
         elif cls_name in LANE_CLASSES:
             lane_count += 1
+        elif cls_name in BARRIER_CLASSES:
+            barrier_count += 1
+
+    traffic_density = int(vehicle_count / (1 + lane_count + barrier_count))
 
     elapsed = round(time.time() - start, 3)
 
-    # ---- Luu preview (ve bbox tren ban sao) ----
+    # ---- Luu preview ----
     try:
         annotated_img = _draw_boxes(img.copy(), results)
         buf = io.BytesIO()
         annotated_img.save(buf, format="JPEG", quality=85)
         annotated_bytes = buf.getvalue()
-
         with _preview_lock:
             _last_annotated = annotated_bytes
             _last_raw       = raw
             _last_meta      = {
-                "vehicle_count": vehicle_count,
-                "lane_count":    lane_count,
-                "inference_ms":  int(elapsed * 1000),
-                "timestamp":     time.strftime("%Y-%m-%d %H:%M:%S"),
-                "img_size_kb":   round(len(raw) / 1024, 1),
-                "img_wh":        f"{img.width}x{img.height}",
+                "vehicle_count":   vehicle_count,
+                "lane_count":      lane_count,
+                "barrier_count":   barrier_count,
+                "traffic_density": traffic_density,
+                "inference_ms":    int(elapsed * 1000),
+                "timestamp":       time.strftime("%Y-%m-%d %H:%M:%S"),
+                "img_size_kb":     round(len(raw) / 1024, 1),
+                "img_wh":          f"{img.width}x{img.height}",
             }
     except Exception as e:
         print(f"[PREVIEW] Loi ve bbox: {e}")
 
     response = {
-        "vehicle_count": vehicle_count,
-        "lane_count":    lane_count,
-        "inference_ms":  int(elapsed * 1000)
+        "vehicle_count":   vehicle_count,
+        "lane_count":      lane_count,
+        "barrier_count":   barrier_count,
+        "traffic_density": traffic_density,
+        "inference_ms":    int(elapsed * 1000)
     }
     print(f"[SERVER] Ket qua: {response}")
     return jsonify(response), 200
@@ -154,12 +163,14 @@ def preview():
         </div></body></html>"""
         return Response(html, mimetype="text/html")
 
-    v  = meta.get("vehicle_count", 0)
-    l  = meta.get("lane_count",    0)
-    ms = meta.get("inference_ms",  0)
-    ts = meta.get("timestamp",     "")
-    sz = meta.get("img_size_kb",   0)
-    wh = meta.get("img_wh",        "")
+    v  = meta.get("vehicle_count",   0)
+    l  = meta.get("lane_count",      0)
+    b  = meta.get("barrier_count",   0)
+    td = meta.get("traffic_density", 0)
+    ms = meta.get("inference_ms",    0)
+    ts = meta.get("timestamp",       "")
+    sz = meta.get("img_size_kb",     0)
+    wh = meta.get("img_wh",          "")
 
     html = f"""
     <html><head><meta charset='utf-8'>
@@ -170,7 +181,7 @@ def preview():
            display:flex;flex-direction:column;align-items:center;padding:1rem}}
       h2{{margin:.5rem 0;font-size:1.1rem;color:#adf}}
       img{{max-width:min(640px,95vw);border:2px solid #444;border-radius:6px;margin:.5rem 0}}
-      .stats{{display:flex;gap:1.5rem;flex-wrap:wrap;justify-content:center;
+      .stats{{display:flex;gap:1rem;flex-wrap:wrap;justify-content:center;
               margin:.4rem 0;font-size:.9rem}}
       .chip{{background:#1e1e2e;border:1px solid #444;border-radius:20px;
              padding:.3rem .9rem}}
@@ -178,6 +189,8 @@ def preview():
       .grn{{border-color:#5d5;color:#8f8}}
       .blu{{border-color:#55f;color:#88f}}
       .yel{{border-color:#dd5;color:#ee8}}
+      .pur{{border-color:#a5f;color:#c8f}}
+      .ora{{border-color:#f90;color:#fba}}
       small{{color:#555;font-size:.75rem;margin-top:.3rem}}
     </style>
     </head>
@@ -187,6 +200,8 @@ def preview():
       <div class='stats'>
         <span class='chip red'>&#128663; Xe: <b>{v}</b></span>
         <span class='chip grn'>&#9135; Lane: <b>{l}</b></span>
+        <span class='chip pur'>&#9646; Barrier: <b>{b}</b></span>
+        <span class='chip ora'>&#128202; Traffic: <b>{td}</b></span>
         <span class='chip blu'>&#9201; {ms} ms</span>
         <span class='chip yel'>&#128190; {sz} KB &nbsp;|&nbsp; {wh}</span>
       </div>
