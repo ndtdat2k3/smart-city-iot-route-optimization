@@ -11,6 +11,14 @@
 #include <TimeLib.h>
 #include "esp_task_wdt.h"
 
+// Forward declarations
+void TaskSensors(void*);
+void TaskProcessing(void*);
+void TaskCAMReceive(void*);
+void TaskSerial(void*);
+void TaskPublish(void*);
+void TaskModem(void*);
+
 // ================= SENSOR PINS =================
 #define MQ135_PIN  34
 #define measurePin 35
@@ -69,8 +77,7 @@ typedef struct {
 } ProcessedData;
 
 typedef struct {
-  int  vehicleCount;
-  int  laneCount;
+  int  trafficDensity;
   bool valid;
 } VehicleData;
 
@@ -82,7 +89,7 @@ uint8_t*   camImgBuf   = nullptr;
 size_t     camImgLen   = 0;
 volatile bool camImgReady = false;
 
-VehicleData latestVehicle = {0, 0, false};
+VehicleData latestVehicle = {0, false};
 
 // ================================================================
 //  HELPER FUNCTIONS
@@ -308,13 +315,11 @@ bool doYoloRequest(uint8_t* imgBuf, size_t imgLen, const char* urlStr) {
   Serial.printf("[YOLO] HTTP %d | %s\n", httpCode, body.c_str());
   if (httpCode != 200) return false;
 
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<256> doc;  // [FIX] 128 -> 256: tranh tran khi co them barrier_count
   if (deserializeJson(doc, body)) { Serial.println("[YOLO] JSON loi!"); return false; }
-  latestVehicle.vehicleCount = doc["vehicle_count"] | 0;
-  latestVehicle.laneCount    = doc["lane_count"]    | 0;
-  latestVehicle.valid        = true;
-  Serial.printf("[YOLO] Xe: %d | Lane: %d\n",
-                latestVehicle.vehicleCount, latestVehicle.laneCount);
+  latestVehicle.trafficDensity = doc["traffic_density"] | 0;
+  latestVehicle.valid          = true;
+  Serial.printf("[YOLO] TrafficDensity: %d\n", latestVehicle.trafficDensity);
   Serial.printf("[DEBUG] TaskModem stack con lai: %d bytes\n",
                 uxTaskGetStackHighWaterMark(NULL));
   return true;
@@ -435,9 +440,8 @@ void TaskModem(void *pvParameters) {
                               // TinyGSM/mqtt.connect() block lâu là bình thường
                               // IDLE task CPU0 vẫn được monitor bình thường
   
-  ProcessedData sensorData;
-  unsigned long lastPublish = 0;
-  bool          mqttOK      = false;
+  ProcessedData sensorData;  // tam thoi giu lai de tranh loi bien chua khai bao o cac noi khac
+  bool          mqttOK = false;
 
   while (1) {
     // ---- 0. [FIX] NHAN URL MOI TU loop() NEU CO ----
@@ -499,34 +503,8 @@ void TaskModem(void *pvParameters) {
       mqtt.loop();
     }
 
-    // ---- 5. PUBLISH MQTT moi 5 giay ----
-    if (millis() - lastPublish >= 5000) {
-      lastPublish = millis();
-      if (xQueuePeek(processedQueue, &sensorData, 0) == pdTRUE) {
-        unsigned long ts = getCurrentTimestamp();
-        StaticJsonDocument<300> doc;
-        doc["temp"]       = String(sensorData.temp, 2);
-        doc["hum"]        = String(sensorData.hum,  2);
-        doc["gasIndex"]   = String(sensorData.gasIndex, 2);
-        doc["aqi"]        = sensorData.aqi;
-        doc["timestamp"]  = (long)ts;
-        doc["lastUpdate"] = convertTimestampToString(ts);
-        if (latestVehicle.valid) {
-          doc["vehicleCount"] = latestVehicle.vehicleCount;
-          doc["laneCount"]    = latestVehicle.laneCount;
-        }
-        char buf[300];
-        serializeJson(doc, buf);
-        if (mqtt.connected()) {
-          mqtt.publish(topic, buf);
-          Serial.println("Da gui MQTT:"); Serial.println(buf);
-          Serial.println("------------------");
-        }
-      }
-    }
-
-    // ---- 6. YIELD 200ms – du cho mqtt.loop() chay ~5 lan/giay ----
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+    // ---- 5. YIELD 50ms – mqtt.loop() van duoc goi thuong xuyen ----
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
@@ -601,20 +579,50 @@ void setup() {
   xTaskCreatePinnedToCore(TaskSensors,    "Sensors",    4096,  NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskProcessing, "Processing", 4096,  NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskCAMReceive, "CAMReceive", 8192,  NULL, 5, NULL, 1);
-  xTaskCreatePinnedToCore(TaskSerial,     "Serial",     4096,  NULL, 1, NULL, 1);  // [FIX] Thay loop()
-  xTaskCreatePinnedToCore(TaskModem,      "Modem",      28672, NULL, 2, NULL, 0);  // [FIX] 20480->28672: du cho malloc+String trong doYoloRequest
+  xTaskCreatePinnedToCore(TaskSerial,     "Serial",     4096,  NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskPublish,    "Publish",    4096,  NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(TaskModem,      "Modem",      28672, NULL, 2, NULL, 0);
+}
+
+void loop() {
+  vTaskDelay(portMAX_DELAY);
 }
 
 // ================================================================
-//  LOOP – nhuong CPU hoan toan, logic Serial da chuyen vao TaskSerial
+//  TASK PUBLISH – Publish MQTT chinh xac moi 5 giay  (CPU 0)
 // ================================================================
-void loop() {
-  vTaskDelay(portMAX_DELAY);  // [FIX] delay(500) -> vTaskDelay: idle task chay duoc, WDT khong timeout
+void TaskPublish(void *pvParameters) {
+  ProcessedData sensorData;
+  const TickType_t interval = pdMS_TO_TICKS(5000);
+  TickType_t       lastWake = xTaskGetTickCount();
+
+  while (1) {
+    vTaskDelayUntil(&lastWake, interval);
+
+    if (!mqtt.connected()) continue;
+    if (xQueuePeek(processedQueue, &sensorData, 0) != pdTRUE) continue;
+
+    unsigned long ts = getCurrentTimestamp();
+    StaticJsonDocument<300> doc;
+    doc["temp"]       = String(sensorData.temp, 2);
+    doc["hum"]        = String(sensorData.hum,  2);
+    doc["gasIndex"]   = String(sensorData.gasIndex, 2);
+    doc["aqi"]        = sensorData.aqi;
+    doc["timestamp"]  = (long)ts;
+    doc["lastUpdate"] = convertTimestampToString(ts);
+    if (latestVehicle.valid) {
+      doc["trafficDensity"] = latestVehicle.trafficDensity;
+    }
+    char buf[300];
+    serializeJson(doc, buf);
+    mqtt.publish(topic, buf);
+    Serial.println("Da gui MQTT:"); Serial.println(buf);
+    Serial.println("------------------");
+  }
 }
 
 // ================================================================
 //  TASK SERIAL – Nhan lenh SET_SERVER_URL tu Serial Monitor (CPU 1)
-//  [FIX] Tach khoi loop() de tranh readStringUntil block WDT idle task
 // ================================================================
 void TaskSerial(void *pvParameters) {
   while (1) {
@@ -629,6 +637,6 @@ void TaskSerial(void *pvParameters) {
         Serial.printf("[CONFIG] URL hien tai: %s\n", serverUrl);
       }
     }
-    vTaskDelay(100 / portTICK_PERIOD_MS);  // yield dung cach
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
